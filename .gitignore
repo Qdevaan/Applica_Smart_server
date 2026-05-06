@@ -1,3 +1,12 @@
 node_modules/
 venv/
 __pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Output artifacts (generated — do not commit)
+data/processed/
+final_results.json
+jobs.json
+
