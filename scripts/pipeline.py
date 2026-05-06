@@ -110,8 +110,13 @@ Sincerely,
     return letter
 
 
-def generate_cover_letter_mistral(resume_skills, jd_skills, job_title, company, applicant_name,resume_snippet):
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "60"))
 
+
+def generate_cover_letter_mistral(resume_skills, jd_skills, job_title, company, applicant_name, resume_snippet):
+    """Generate cover letter via Ollama. Raises RuntimeError on connection/timeout/HTTP/parse failure so caller can fall back."""
     prompt = f"""
 Write a highly professional and natural cover letter.
 
@@ -148,20 +153,21 @@ Sincerely,
 
 Write 180–220 words only.
 """
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={
-            "model": "mistral",
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.9,
-                "num_predict": 600
-            }
-        }
-    )
-
-    output = response.json()["response"]
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.9, "num_predict": 600},
+            },
+            timeout=OLLAMA_TIMEOUT,
+        )
+        response.raise_for_status()
+        output = response.json()["response"]
+    except (requests.ConnectionError, requests.Timeout, requests.HTTPError, ValueError, KeyError) as e:
+        raise RuntimeError(f"Ollama generation failed: {type(e).__name__}: {e}") from e
 
     # STEP 3: FORCE ENDING
     if "Sincerely" not in output:
@@ -229,16 +235,13 @@ def process_application(resume_pdf_path: str, job_description_text: str,job_titl
     
 
 
-    # 6) Generate cover letter
-    cover_letter = generate_cover_letter_mistral(
-    resume_skills_norm,
-    jd_skills_norm,
-    job_title,
-    company,
-    applicant_name,
-    resume_snippet
-)
-  
+    # 6) Generate cover letter (LLM with template fallback)
+    cover_letter, cover_letter_source = _generate_cover_letter_with_fallback(
+        cleaned_resume, cleaned_jd,
+        resume_skills_norm, jd_skills_norm, missing_skills,
+        job_title, company, applicant_name, resume_snippet,
+    )
+
 
     # 7) Save outputs (optional)
     saved_paths = {}
@@ -291,13 +294,12 @@ def process_application(resume_pdf_path: str, job_description_text: str,job_titl
         "missing_skills": missing_skills,
         "similarity": similarity,
         "cover_letter": cover_letter,
+        "cover_letter_source": cover_letter_source,
         "saved_paths": saved_paths,
         "recommendation": recommendation,
         "applicant_name": applicant_name,
         "job_title": job_title,
-        "company": company
-
-
+        "company": company,
     }
 
     return result
@@ -330,13 +332,10 @@ def process_application_text(resume_text: str, job_description_text: str,
     recommendation = get_recommendation(similarity, missing_skills)
     applicant_name = extract_name_from_resume(resume_text)
 
-    cover_letter = generate_cover_letter_mistral(
-        resume_skills_norm,
-        jd_skills_norm,
-        job_title,
-        company,
-        applicant_name,
-        resume_snippet,
+    cover_letter, cover_letter_source = _generate_cover_letter_with_fallback(
+        cleaned_resume, cleaned_jd,
+        resume_skills_norm, jd_skills_norm, missing_skills,
+        job_title, company, applicant_name, resume_snippet,
     )
 
     return {
@@ -345,11 +344,33 @@ def process_application_text(resume_text: str, job_description_text: str,
         "missing_skills": missing_skills,
         "similarity": similarity,
         "cover_letter": cover_letter,
+        "cover_letter_source": cover_letter_source,
         "recommendation": recommendation,
         "applicant_name": applicant_name,
         "job_title": job_title,
         "company": company,
     }
+
+
+def _generate_cover_letter_with_fallback(
+    resume_text, jd_text,
+    resume_skills, jd_skills, missing_skills,
+    job_title, company, applicant_name, resume_snippet,
+):
+    """Try Ollama first. Fall back to deterministic template on any failure."""
+    try:
+        text = generate_cover_letter_mistral(
+            resume_skills, jd_skills, job_title, company, applicant_name, resume_snippet,
+        )
+        return text, "llm"
+    except RuntimeError as e:
+        print(f"[cover_letter] Ollama unavailable, using template fallback: {e}")
+        text = generate_cover_letter_pro(
+            resume_text, jd_text,
+            resume_skills, jd_skills, missing_skills,
+            job_title, company, applicant_name,
+        )
+        return text, "template"
 
 
 # this is the function to generate recommendation based on similarity and missing skills

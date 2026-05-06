@@ -15,6 +15,7 @@ class AnalyzeResponse(BaseModel):
     missing_skills: list[str]
     similarity: float
     cover_letter: str
+    cover_letter_source: str = "llm"
     recommendation: str
     applicant_name: str
     job_title: str
