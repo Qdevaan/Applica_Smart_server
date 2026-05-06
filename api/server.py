@@ -1,103 +1,148 @@
-import sys
+"""FastAPI application entry point.
+
+Run locally:
+    uvicorn api.server:app --reload --host 0.0.0.0 --port 8000
+
+Run via env:
+    HOST=0.0.0.0 PORT=8000 python -m api.server
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import sys
 
-import json
-from fastapi import FastAPI, HTTPException
+# Allow `from api.*` and `from services.*` imports when launched from anywhere.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from api.models import AnalyzeRequest, AnalyzeResponse, BatchAnalyzeRequest, JobResult
-from scripts.pipeline import process_application_text
-from scripts.preprocess import preprocess_text
-from scripts.semantic_similarity import get_semantic_similarity as get_similarity
-
-app = FastAPI(title="Applica-Smart ML API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from api.config import get_settings
+from api.errors import (
+    http_exception_handler,
+    unhandled_exception_handler,
+    validation_exception_handler,
 )
-
-JOBS_PATH = os.path.join(os.path.dirname(__file__), "..", "jobs.json")
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+from api.middleware import RequestIDMiddleware
+from api.routes import cover_letters, health, jobs, resumes
 
 
-@app.post("/api/pipeline/analyze", response_model=AnalyzeResponse)
-def analyze_single(req: AnalyzeRequest):
-    """Analyze one resume text against one job description."""
-    try:
-        result = process_application_text(
-            resume_text=req.resume_text,
-            job_description_text=req.job_description,
-            job_title=req.job_title,
-            company=req.company,
+def create_app() -> FastAPI:
+    settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    app = FastAPI(
+        title="Applica-Smart ML Server",
+        version="1.0.0",
+        description="Resume parsing, JD analysis, cover letter generation, job matching.",
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+    )
+
+    app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_origin_regex=settings.cors_origin_regex,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
+    )
+
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)
+
+    app.include_router(health.router)
+    app.include_router(resumes.router)
+    app.include_router(cover_letters.router)
+    app.include_router(jobs.router)
+
+    _attach_legacy_aliases(app)
+    return app
+
+
+def _attach_legacy_aliases(app: FastAPI) -> None:
+    """Keep old `/api/pipeline/*` and `/api/jobs` routes alive during frontend migration."""
+    from fastapi import Depends
+
+    from api.deps import get_ollama_or_none
+    from api.routes.jobs import list_jobs as list_jobs_route
+    from api.routes.jobs import match as match_route
+    from api.routes.resumes import analyze as analyze_route
+
+    @app.get("/health", include_in_schema=False)
+    def _legacy_health():
+        return {"status": "ok"}
+
+    @app.post("/api/pipeline/analyze", include_in_schema=False)
+    async def _legacy_analyze(body: dict):
+        from api.schemas import AnalyzeRequest
+
+        req = AnalyzeRequest(
+            resume_text=body.get("resume_text", ""),
+            job_description=body.get("job_description", ""),
+            job_title=body.get("job_title"),
+            company=body.get("company"),
         )
-        return AnalyzeResponse(**result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        result = await analyze_route(req)
+        return {
+            "resume_skills": result.resume_skills,
+            "jd_skills": result.jd_skills,
+            "missing_skills": result.skill_gap.missing,
+            "similarity": result.similarity,
+            "cover_letter": "",
+            "recommendation": result.recommendation,
+            "applicant_name": result.applicant_name,
+            "job_title": result.job_title,
+            "company": result.company,
+        }
+
+    @app.post("/api/pipeline/analyze-batch", include_in_schema=False)
+    async def _legacy_analyze_batch(body: dict, ollama=Depends(get_ollama_or_none)):
+        from api.schemas import MatchRequest
+
+        req = MatchRequest(resume_text=body.get("resume_text", ""))
+        result = await match_route(req, ollama=ollama)  # type: ignore[call-arg]
+        return [
+            {
+                "title": m.title,
+                "company": m.company,
+                "similarity": m.similarity,
+                "recommendation": m.recommendation,
+                "cover_letter": m.cover_letter or "Not generated (only top 3)",
+                "cover_letter_file": None,
+            }
+            for m in result.matches
+        ]
+
+    @app.get("/api/jobs", include_in_schema=False)
+    def _legacy_jobs():
+        return list_jobs_route()
 
 
-@app.post("/api/pipeline/analyze-batch", response_model=list[JobResult])
-def analyze_batch(req: BatchAnalyzeRequest):
-    """Score resume against all jobs in jobs.json, return top 5 with cover letters."""
-    if not os.path.exists(JOBS_PATH):
-        raise HTTPException(
-            status_code=404,
-            detail="jobs.json not found — run the scraper first: cd FYP/job_scraper && node main_scraper.js"
-        )
-    with open(JOBS_PATH, "r", encoding="utf-8") as f:
-        jobs = json.load(f)
-
-    cleaned_resume = preprocess_text(req.resume_text)
-
-    scored = []
-    for job in jobs:
-        jd = job.get("description", "")
-        if not jd or len(jd) < 50:
-            continue
-        cleaned_jd = preprocess_text(jd)
-        try:
-            score = float(get_similarity(cleaned_resume, cleaned_jd))
-        except Exception:
-            score = 0.0
-        scored.append({"job": job, "score": score})
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    top = scored[:5]
-
-    results = []
-    for idx, item in enumerate(top):
-        job = item["job"]
-        output = process_application_text(
-            resume_text=req.resume_text,
-            job_description_text=job.get("description", ""),
-            job_title=job.get("title"),
-            company=job.get("company"),
-        )
-        cover_letter = output["cover_letter"] if idx < 3 else "Not generated (only top 3)"
-        results.append(JobResult(
-            title=job.get("title"),
-            company=job.get("company"),
-            similarity=output["similarity"],
-            recommendation=output["recommendation"],
-            cover_letter=cover_letter,
-            cover_letter_file=None,
-        ))
-
-    return results
+app = create_app()
 
 
-@app.get("/api/jobs", response_model=list[dict])
-def get_jobs():
-    """Return raw jobs from jobs.json."""
-    if not os.path.exists(JOBS_PATH):
-        raise HTTPException(status_code=404, detail="jobs.json not found")
-    with open(JOBS_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+if __name__ == "__main__":
+    import uvicorn
+
+    settings = get_settings()
+    uvicorn.run(
+        "api.server:app",
+        host=settings.host,
+        port=settings.port,
+        reload=False,
+        log_level=settings.log_level,
+    )
